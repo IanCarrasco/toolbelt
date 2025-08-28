@@ -15,7 +15,7 @@ create_tool(name: "convert_timezone", description: "Converts a timezone from GMT
 
 ```
 create_tool(
-    tool_schema_json: 
+    tool_json_schema: 
      """{
         "type": "function",
         "name": "get_flight_info",
