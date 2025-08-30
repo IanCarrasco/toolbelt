@@ -28,7 +28,7 @@ client = OpenAI(api_key=os.environ['OPENAI_TOOLBELT_KEY'])
 
 async def run_toolbelt_session(request: SessionRequest):
     session = ToolbeltSession(client=client)
-    async for message in session.run(user_request=request.user_query):
+    async for message in session.run(user_request=request.user_query, session_id=request.session_id):
         yield f"data: {message}\n\n"
 
 @app.post("/start-session")

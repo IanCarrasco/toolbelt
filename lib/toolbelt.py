@@ -4,6 +4,8 @@ from openai import OpenAI
 import json
 import concurrent.futures
 import os
+from dotenv import load_dotenv
+from supabase import create_client, Client
 
 import re
 
@@ -42,7 +44,7 @@ class ToolbeltSession():
         self.response_thread = []
         self.client = client
         self.tool_dir = tool_dir
-        self.tools_to_create = []
+        self.tools_to_create = {}
         self.tool_fns = {}
 
     # Takes in a json-schema tool spec and writes a python function that satisfies it.
@@ -60,7 +62,7 @@ class ToolbeltSession():
         return output_text
 
     # Runs the full tool creation and tool use flow for a given user request.
-    async def run(self, user_request: str):
+    async def run(self, user_request: str, session_id: str, user_id: str):
         self.creation_thread.append({"role": "user", "content": user_request})
         
         yield "Determining necessary tool definitions..."
@@ -74,9 +76,9 @@ class ToolbeltSession():
         self.creation_thread.append(tool_creation_response.output)
 
         # Gather all create tool call results (json-schemas)
-        self.tools_to_create.extend(extract_tool_specs(tool_creation_response.output_text))
+        for tool in extract_tool_specs(tool_creation_response.output_text):
+            self.tools_to_create[tool['name']] = tool
     
-
         # Write the source code for each tool based on the tool definitions
         yield "Great! I need to write the source for the following tools:"
         for t in self.tools_to_create:
@@ -98,6 +100,25 @@ class ToolbeltSession():
             "content": f"I have went ahead and successfully created {len(self.tools_to_create)} tools: {','.join([t['name'] for t in self.tools_to_create])}"
         })
         
+        supabase_url = os.environ.get("SUPABASE_URL")
+        supabase_key = os.environ.get("SUPABASE_KEY")
+        client = create_client(supabase_url, supabase_key)
+        try:
+            # Example: insert a log of the tool creation event
+            tool_batch = []
+            for tool_name in self.tools_to_create.keys():
+                tool_batch.append({
+                    "name": tool_name,
+                    "description": self.tools_to_create[tool_name]['description'],
+                    "session_id": session_id,
+                    "python_source": self.tool_fns[tool_name],
+                    "json_schema": self.tools_to_create[tool_name],
+                    "creator": user_id
+                })
+            client.table("tools").insert(tool_batch).execute()
+            yield "Added tools to the Supabase collection."
+        except Exception as e:
+            yield f"Failed to log to Supabase: {str(e)}"
         
         # Initialize a new thread for using the newly created tools
         # Create a new tools list just containing the tools required to solve the task
@@ -183,6 +204,7 @@ class ToolbeltSession():
 
 if __name__ == '__main__':
     import asyncio
-    client = OpenAI(api_key=os.environ['OPENAI_TOOLBELT_KEY'])
+    load_dotenv()
+    client = OpenAI(api_key=os.getenv('OPENAI_TOOLBELT_KEY'))
     session = ToolbeltSession(client=client)
     asyncio.run(session.run('How long would it take in seconds to walk from new york to LA'))
