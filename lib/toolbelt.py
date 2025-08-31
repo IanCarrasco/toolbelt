@@ -7,6 +7,12 @@ import os
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env.local'))
+
+supabase_url = os.environ.get("SUPABASE_URL")
+supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
+supabase_client = create_client(supabase_url, supabase_key)
+
 import re
 
 def extract_tool_specs(content):
@@ -46,6 +52,8 @@ class ToolbeltSession():
         self.tool_dir = tool_dir
         self.tools_to_create = {}
         self.tool_fns = {}
+        # Read the run_log from the supabase sessions collection
+        self.run_log = []
 
     # Takes in a json-schema tool spec and writes a python function that satisfies it.
     def generate_and_write_tool(self, tool):
@@ -72,7 +80,6 @@ class ToolbeltSession():
             instructions=load_system_prompt("tool_creation")
         )
         # Creates all necessary tool specs to satisfy the user request
-        yield f"Debug: Tool creation response received with {len(tool_creation_response.output)} items"
         self.creation_thread.append(tool_creation_response.output)
 
         # Gather all create tool call results (json-schemas)
@@ -81,14 +88,14 @@ class ToolbeltSession():
     
         # Write the source code for each tool based on the tool definitions
         yield "Great! I need to write the source for the following tools:"
-        for t in self.tools_to_create:
+        for t in self.tools_to_create.values():
             yield f'{t["name"]}: {t["description"]}'
 
         # Write each tool's source code in parallel and store them
         yield 'Writing tool source code....'
         try:
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                results = list(executor.map(lambda t: {'name': t['name'], 'tool_fn': self.generate_and_write_tool(t)}, self.tools_to_create))
+                results = list(executor.map(lambda t: {'name': t['name'], 'tool_fn': self.generate_and_write_tool(t)}, self.tools_to_create.values()))
                 for result in results:
                     self.tool_fns[result['name']] = result['tool_fn']
             yield f'Finished writing code for {len(results)} tools'
@@ -97,12 +104,9 @@ class ToolbeltSession():
 
         self.creation_thread.append({
             "role":"user",
-            "content": f"I have went ahead and successfully created {len(self.tools_to_create)} tools: {','.join([t['name'] for t in self.tools_to_create])}"
+            "content": f"I have went ahead and successfully created {len(self.tools_to_create)} tools: {','.join([t['name'] for t in self.tools_to_create.values()])}"
         })
         
-        supabase_url = os.environ.get("SUPABASE_URL")
-        supabase_key = os.environ.get("SUPABASE_KEY")
-        client = create_client(supabase_url, supabase_key)
         try:
             # Example: insert a log of the tool creation event
             tool_batch = []
@@ -110,12 +114,12 @@ class ToolbeltSession():
                 tool_batch.append({
                     "name": tool_name,
                     "description": self.tools_to_create[tool_name]['description'],
-                    "session_id": session_id,
+                    "session": session_id,
                     "python_source": self.tool_fns[tool_name],
                     "json_schema": self.tools_to_create[tool_name],
                     "creator": user_id
                 })
-            client.table("tools").insert(tool_batch).execute()
+            supabase_client.table("tools").insert(tool_batch).execute()
             yield "Added tools to the Supabase collection."
         except Exception as e:
             yield f"Failed to log to Supabase: {str(e)}"
@@ -127,19 +131,17 @@ class ToolbeltSession():
         yield "Analyzing your request and determining which tools to use..."
         
         # Ensure we have tools to work with
-        if not self.tools_to_create:
+        if len(self.tools_to_create) == 0:
             yield "No tools were created, cannot proceed with execution."
             
         use_tool_response = self.client.responses.create(
             model="gpt-5-nano",
-            tools=self.tools_to_create,
+            tools=self.tools_to_create.values(),
             input=self.response_thread,
             instructions=load_system_prompt('use_tool'),
-            tool_choice={'type':'allowed_tools', 'mode':'auto', 'tools': [{'type':'function', 'name': t['name']} for t in self.tools_to_create]},
+            tool_choice={'type':'allowed_tools', 'mode':'required', 'tools': [{'type':'function', 'name': t['name']} for t in self.tools_to_create.values()]},
         )
 
-        yield f"Debug: Received use_tool_response with {len(use_tool_response.output)} items"
-        
         # Extract only the serializable parts from the response
         response_items = []
         for item in use_tool_response.output:
@@ -159,8 +161,6 @@ class ToolbeltSession():
             if item["type"] == "function_call":
                 function_call_arguments = json.loads(item["arguments"])
                 new_fn_invocations.append((item, function_call_arguments))
-        
-        yield f"Debug: Processed {len(new_fn_invocations)} function invocations"
         
         if new_fn_invocations:
             yield f"I need to execute {len(new_fn_invocations)} tool(s) to answer your question..."
@@ -204,7 +204,6 @@ class ToolbeltSession():
 
 if __name__ == '__main__':
     import asyncio
-    load_dotenv()
     client = OpenAI(api_key=os.getenv('OPENAI_TOOLBELT_KEY'))
     session = ToolbeltSession(client=client)
     asyncio.run(session.run('How long would it take in seconds to walk from new york to LA'))
